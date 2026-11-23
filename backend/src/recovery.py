@@ -19,7 +19,10 @@ def sources(cur, hour_id):
 
 
 def for_hour(cur, hour_id):
-    cur.execute('SELECT c.*,s.name,s.code FROM tenant_recoveries c JOIN stores s ON s.id=c.store_id '
+    cur.execute('SELECT c.*,s.name,s.code,g.owner_id,u.username AS owner_name '
+                'FROM tenant_recoveries c JOIN stores s ON s.id=c.store_id '
+                'LEFT JOIN recovery_handoffs g ON g.case_id=c.id '
+                'LEFT JOIN users u ON u.id=g.owner_id '
                 'WHERE c.hour_id=%s ORDER BY c.id DESC', (hour_id,))
     cases = cur.fetchall()
     checks = recovery_checks.checks_for_hour(cur, hour_id)
@@ -66,6 +69,7 @@ def lock_case(cur, key):
 
 def apply_action(cur, key, data, actor):
     case = lock_case(cur, key)
+    recovery_checks.require_owner(cur, case, actor)
     if case['status'] != 'open':
         raise HTTPException(409, '该工单已登记改进措施')
     if data.slot_start < case['hour_start'] + timedelta(hours=1):

@@ -86,6 +86,12 @@ def publish_handoff(data: HandoffInput, user=Depends(operator)):
         return handoffs.publish(cur, data, user['id'])
 
 
+@router.post('/handoffs/{key}/reconcile')
+def reconcile_handoff(key: int, user=Depends(steward)):
+    with transaction() as cur:
+        return handoffs.reconcile(cur, key, user['id'])
+
+
 @router.post('/handoffs/{key}/ack')
 def acknowledge_handoff(key: int, data: Note, user=Depends(steward)):
     with transaction() as cur:

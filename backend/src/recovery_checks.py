@@ -8,6 +8,14 @@ from .storage import audit
 CHECK_INTERVAL = timedelta(minutes=15)
 
 
+def require_owner(cur, case, actor):
+    # Once a handoff is signed, only the recipient may keep working the transferred case.
+    cur.execute('SELECT owner_id FROM recovery_handoffs WHERE case_id=%s', (case['id'],))
+    handoff = cur.fetchone()
+    if handoff and handoff['owner_id'] != actor:
+        raise HTTPException(403, '该工单已整批转交，请由签收的现场疏导员登记措施和复查')
+
+
 def checks_for_hour(cur, hour_id):
     cur.execute('SELECT c.*,u.username FROM recovery_checks c JOIN tenant_recoveries r ON r.id=c.case_id '
                 'JOIN users u ON u.id=c.recorded_by WHERE r.hour_id=%s ORDER BY c.case_id,c.slot_start', (hour_id,))
@@ -31,6 +39,7 @@ def latest_checks(cur, key):
 
 
 def record(cur, case, data, actor):
+    require_owner(cur, case, actor)
     if case['status'] != 'monitoring':
         raise HTTPException(409, '只有执行改进措施后的工单可以记录复查')
     if data.slot_start < case['action_slot'] + CHECK_INTERVAL:

@@ -1,5 +1,5 @@
 import {api, shiftQuery, state} from '../state.js';
-import {badge, empty, header, input, pointLabel, readForm, stamp, table, text} from '../ui.js';
+import {badge, empty, header, input, readForm, stamp, table, text} from '../ui.js';
 
 const responsePhases = {planned: '待执行', active: '控流中', resolved: '已解除', cancelled: '已撤销'};
 const recoveryPhases = {open: '待跟进', monitoring: '复查中', closed: '已结案'};
@@ -16,13 +16,50 @@ function reportSheet(report) {
     ${report.surges?.length ? `<div class="handoff-section"><h3>临时控流</h3>${table(['方案', '锚点', '起报', '解除复测', '发布时状态'], report.surges.map(row => [
       `#${row.id}`, text(row.anchor), `${row.reported_queue} 人`, row.release_queue == null ? '—' : `${row.release_queue} 人`, responsePhases[row.status],
     ]))}</div>` : ''}
-    ${report.recoveries?.length ? `<div class="handoff-section"><h3>门店服务恢复</h3>${table(['工单', '门店', '待处理问题', '复查', '发布时状态'], report.recoveries.map(row => [
+    ${report.recoveries?.length ? `<div class="handoff-section"><h3>门店服务恢复 · 发布时快照</h3>${table(['工单', '门店', '待处理问题', '复查', '发布时状态'], report.recoveries.map(row => [
       `#${row.id}`, text(row.name), text(row.issue_note), `${row.checks} 次`, recoveryPhases[row.status],
     ]))}<p><a href="#recoveries">查看工单当前进度</a></p></div>` : ''}
     <div class="handoff-section"><h3>下班次继续关注</h3>${report.watch.length ? table(['入口', '原因', '窗口', '补采说明'], report.watch.map(item => [
-      text(item.name), `${pointLabel[item.kind]}${item.kind === 'noise' ? ` · 中位 ${item.median_queue} 人` : ''}`, `${item.windows}/4`, text(item.waiver_reason || '—'),
+      text(item.name), `${pointLabelText(item.kind)}${item.kind === 'noise' ? ` · 中位 ${item.median_queue} 人` : ''}`, `${item.windows}/4`, text(item.waiver_reason || '—'),
     ])) : empty('本轮没有样本不足或孤立拥堵入口。')}</div>
     ${report.lane_uses.length ? `<div class="handoff-section"><h3>已释放的等候线</h3><ul class="known-lines">${report.lane_uses.map(line => `<li>${text(line.lane_name)} · 疏导 #${line.task_id}<b>入线 ${line.moved_count} 人</b></li>`).join('')}</ul></div>` : ''}`;
+}
+
+function pointLabelText(kind) {
+  return {insufficient: '样本不足', below_threshold: '低于阈值', noise: '噪声点', core: '核心点', border: '边界点'}[kind] || kind;
+}
+
+function openCaseTable(rows) {
+  if (!rows.length) return empty('发布时没有未结的服务恢复工单。');
+  return table(['工单', '门店', '状态', '复查次数', '最近复查窗口'], rows.map(row => [
+    `#${row.id}`, `${text(row.code)} · ${text(row.name)}`, recoveryPhases[row.status],
+    `${row.check_count} 次`, row.last_check_at ? stamp(row.last_check_at) : '—',
+  ]));
+}
+
+function reconcilePanel(model, role) {
+  const reconciliation = model.reconciliation;
+  if (model.state === 'received') {
+    const transferred = reconciliation.transferred;
+    const snapshotIds = new Set(model.report.recoveries?.map(row => row.id) || []);
+    const closedAfter = reconciliation.closed_after_publish;
+    return `<div class="handoff-section"><h3>实际接走的工单</h3>
+      ${transferred.length ? table(['工单', '门店', '签收时状态', '接手人', '与快照核对'], transferred.map(row => [
+        `#${row.case_id}`, `${text(row.code)} · ${text(row.name)}`, recoveryPhases[row.status], text(row.owner),
+        snapshotIds.has(row.case_id) ? badge('快照内未结工单', 'good') : badge('发布后新单', 'warm'),
+      ])) : empty('签收时没有需要接手的未结工单。')}
+      ${closedAfter.length ? `<p class="minor">快照中的 #${closedAfter.join('、#')} 已在签收前由原班结案，未列入转交。</p>` : ''}</div>`;
+  }
+  if (role !== 'steward') return '';
+  const check = reconciliation.latest_check;
+  return `<div class="handoff-section"><h3>签收前核对</h3>
+    <p class="minor">先核对同一楼层小时的未结工单并整批接手；核对后若出现新单、结案或进度更新，须重新核对才能签收。</p>
+    ${check ? `<p>最近核对：${stamp(check.at)} · 共 ${check.cases.length} 张未结工单</p>${openCaseTable(check.cases)}
+      ${reconciliation.stale ? `<div class="empty" style="border-left-color:var(--orange);color:var(--ink)">核对后工单有新单、结案或进度更新，请重新核对后再签收。</div>` : ''}`
+      : empty('尚未核对未结工单。')}
+    <form class="stack" id="reconcile-handoff"><button class="secondary">${check ? '重新核对未结工单' : '核对未结工单'}</button></form>
+    ${check && !reconciliation.stale ? `<form class="stack" id="receive-handoff">
+      ${input('签收备注', 'note', 'text', 'required minlength="8" maxlength="200"')}<button>确认核对无误并签收</button></form>` : ''}</div>`;
 }
 
 export async function handoffs() {
@@ -32,24 +69,30 @@ export async function handoffs() {
   return {
     html: `${header('楼层交班', '高峰交接简报', '热区和疏导全部收尾后发布。接班人按同一份快照核对疏导结果与下一班继续关注的入口。')}
       <div class="split"><section class="panel"><div class="section-line"><h2>${state.floor}F · ${stamp(state.hour)} ${badge(phases[model.state], record?.received_by ? 'good' : 'warm')}</h2>
-      <a href="#heat">查看该小时热区</a></div>${model.report ? reportSheet(model.report) : empty('该楼层小时完成热区分析后会生成简报预览。')}</section>
+      <a href="#heat">查看该小时热区</a></div>${model.report ? reportSheet(model.report) : empty('该楼层小时完成热区分析后会生成简报预览。')}
+      ${record ? reconcilePanel(model, role) : ''}</section>
       <aside class="side-note"><h2>交接签收</h2>${model.state === 'waiting_dispatch' ? empty(`还有 ${model.report.pending} 个热区待确认或疏导未结案。`) : ''}
       ${record ? `<div class="handoff-section"><h3>发布 · ${text(record.publisher)}</h3><p>${text(record.publish_note)}</p></div>` : ''}
       ${model.state === 'publishable' && role === 'operator' ? `<form class="stack" id="publish-handoff">
         ${input('交接提示','note','text','required minlength="8" maxlength="200"')}<button>发布交接简报</button></form>` : ''}
-      ${model.state === 'published' && role === 'steward' ? `<form class="stack" id="receive-handoff">
-        ${input('签收备注','note','text','required minlength="8" maxlength="200"')}<button>签收交接简报</button></form>` : ''}
-      ${record?.recipient ? `<div class="handoff-section"><h3>签收 · ${text(record.recipient)}</h3><p>${text(record.receive_note)}</p></div>` : ''}</aside></div>`,
+      ${model.state === 'published' && role !== 'steward' ? empty('等待现场疏导员核对未结工单后签收。') : ''}
+      ${record?.recipient ? `<div class="handoff-section"><h3>签收 · ${text(record.recipient)}</h3><p>${text(record.receive_note)}</p>
+        <p class="minor">签收与转交同时生效，此后接手工单的措施和复查仅由 ${text(record.recipient)} 登记。</p></div>` : ''}</aside></div>`,
     bind(root, action) {
       const publish = root.querySelector('#publish-handoff');
       if (publish) publish.onsubmit = event => {
         event.preventDefault();
         action(() => api('/handoffs', {...readForm(publish), floor: state.floor, hour_start: state.hour}), '交接简报已发布', publish);
       };
+      const reconcileForm = root.querySelector('#reconcile-handoff');
+      if (reconcileForm) reconcileForm.onsubmit = event => {
+        event.preventDefault();
+        action(() => api(`/handoffs/${record.id}/reconcile`), '未结工单核对已刷新，确认无误后可签收', reconcileForm);
+      };
       const receive = root.querySelector('#receive-handoff');
       if (receive) receive.onsubmit = event => {
         event.preventDefault();
-        action(() => api(`/handoffs/${record.id}/ack`, readForm(receive)), '交接简报已签收', receive);
+        action(() => api(`/handoffs/${record.id}/ack`, readForm(receive)), '交接简报已签收，未结工单已整批转交', receive);
       };
     },
   };
